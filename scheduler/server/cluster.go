@@ -279,8 +279,63 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 // processRegionHeartbeat updates the region information.
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 	// Your Code Here (3C).
+  meta := region.GetMeta()
+  if meta == nil {
+    return errors.Errorf("region meta doesn't exist")
+  }
+	if meta.RegionEpoch == nil {
+		return errors.Errorf("region epoch doesn't exist")
+	}
+  // Check if the hearbeats' region is stale
+  preReigon := c.GetRegion(meta.Id)
+  // Check whether there is a region with the same Id in local storage.
+  if preReigon != nil {
+    if meta.RegionEpoch.ConfVer < preReigon.GetMeta().RegionEpoch.ConfVer ||
+      meta.RegionEpoch.Version < preReigon.GetMeta().RegionEpoch.Version {
+        // If there is and at least one of the heartbeats’ conf_ver and version is less than its, this heartbeat region is stale
+        return errors.Errorf("this heartbeat region is stale")
+      }
+  } else {
+    // If there isn’t, scan all regions that overlap with it.
+    for _, region := range c.ScanRegions(meta.StartKey, meta.EndKey, -1) {
+      if meta.RegionEpoch.ConfVer < region.GetMeta().RegionEpoch.ConfVer ||
+        meta.RegionEpoch.Version < region.GetMeta().RegionEpoch.Version {
+          // The heartbeats’ conf_ver and version should be greater or equal than all of them, or the region is stale.
+          return errors.Errorf("this heartbeat region is stale")
+        }
+    }
+  }
 
-	return nil
+  // Check if could skip this update
+  skip := true
+	if preReigon == nil {
+		skip = false
+	} else if meta.RegionEpoch.Version > preReigon.GetMeta().RegionEpoch.Version ||
+    meta.RegionEpoch.ConfVer > preReigon.GetMeta().RegionEpoch.ConfVer {
+    // If the new one’s version or conf_ver is greater than the original one, it cannot be skipped
+    skip = false
+  } else if region.GetLeader() != preReigon.GetLeader() {
+    // If the leader changed, it cannot be skipped
+    skip = false
+  } else if len(region.GetPendingPeers()) > 0 || len(preReigon.GetPendingPeers()) > 0 {
+    // If the new one or original one has pending peer, it cannot be skipped
+    skip = false
+  } else if region.GetApproximateSize() != preReigon.GetApproximateSize() {
+    // If the ApproximateSize changed, it cannot be skipped
+    skip = false
+  }
+
+  if !skip {
+    err := c.putRegion(region)
+    if err != nil {
+      return err
+    }
+    for id := range region.GetStoreIds() {
+      c.updateStoreStatusLocked(id)
+    }
+  }
+
+  return nil
 }
 
 func (c *RaftCluster) updateStoreStatusLocked(id uint64) {
