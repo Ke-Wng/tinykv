@@ -280,3 +280,49 @@ func NewLogger(w io.Writer, prefix string) *Logger {
 	}
 	return &Logger{_log: log.New(w, prefix, LstdFlags), level: level, highlighting: true}
 }
+
+const debugRaft = false
+const debugStore = true
+
+type LogTopic string
+const (
+	// Raft
+	DVote    LogTopic = "VOTE"
+	DAppend  LogTopic = "APPD"
+	DBeat    LogTopic = "BEAT"
+	DState   LogTopic = "STAT"
+	DTimer   LogTopic = "TIMR"
+	DPropose LogTopic = "PROP"
+	DError   LogTopic = "ERRO"
+	DClient  LogTopic = "CLNT"
+	DCommit  LogTopic = "CMIT"
+	DInfo    LogTopic = "INFO"
+	DApply   LogTopic = "APPL"
+	DLog     LogTopic = "LOG1"
+	DPersist LogTopic = "PERS"
+	DSnap    LogTopic = "SNAP"
+	DTerm    LogTopic = "TERM"
+	DConf    LogTopic = "CONF"
+	DRep     LogTopic = "REPL"
+	DWarn    LogTopic = "WARN"
+)
+
+func DPrintf(topic LogTopic, format string, a ...interface{}) {
+	if debugRaft {
+		prefix := fmt.Sprintf("%v ", string(topic))
+		format = prefix + format
+		log.Printf(format, a...)
+	}
+}
+
+func SDebug(format string, a ...interface{}) {
+	if debugStore {
+		Infof(format, a...)
+	}
+}
+
+func Assert(cond bool, format string, a ...interface{}) {
+	if !cond {
+		Panicf(format, a...)
+	}
+}
