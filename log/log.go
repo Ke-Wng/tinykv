@@ -282,7 +282,7 @@ func NewLogger(w io.Writer, prefix string) *Logger {
 }
 
 const debugRaft = false
-const debugStore = true
+const debugStore = false
 
 type LogTopic string
 const (
