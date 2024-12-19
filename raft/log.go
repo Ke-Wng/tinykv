@@ -222,7 +222,6 @@ func (l *RaftLog) append(ents ...*pb.Entry) {
 }
 
 func (l *RaftLog) installSnapshot(snapshot *pb.Snapshot) {
-	// 此处先不急着清理 l.entries，等快照落盘后通过 maybeCompact 清理
 	index, term := snapshot.Metadata.Index, snapshot.Metadata.Term
 	if index < l.LastIndex() && mustTerm(l.Term(index)) == term {
 		// there is an entry at lastIncludedIndex with the same term

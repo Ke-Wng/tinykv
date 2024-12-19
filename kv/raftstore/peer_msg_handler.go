@@ -82,16 +82,39 @@ func (d *peerMsgHandler) findProposal(eindex, eterm uint64) *proposal {
 }
 
 func (d *peerMsgHandler) handleClientRequests(requests []*raft_cmdpb.Request, kvWB *engine_util.WriteBatch, cb *message.Callback) {
-	// 执行读写操作
+	// 检查所有 key 是否都在 region 中，同时执行或同时 abort
+	for _, req := range requests {
+		var key []byte
+		switch req.CmdType {
+		case raft_cmdpb.CmdType_Put:
+			key = req.Put.Key
+		case raft_cmdpb.CmdType_Get:
+			key = req.Get.Key
+		case raft_cmdpb.CmdType_Delete:
+			key = req.Delete.Key
+		}
+		if req.CmdType != raft_cmdpb.CmdType_Snap {
+			if err := util.CheckKeyInRegion(key, d.Region()); err != nil {
+				// 更新 ApplyIndex
+				kvWB.WriteToDB(d.ctx.engine.Kv)
+				if cb != nil {
+					cb.Done(ErrResp(err))
+				}
+				return
+			}
+		}
+	}
+
+	// 执行写操作
 	for _, req := range requests {
 		switch req.CmdType {
 		case raft_cmdpb.CmdType_Put:
 			kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
-      d.SizeDiffHint += uint64(len(req.Put.Key) + len(req.Put.Value))
+      // d.SizeDiffHint += uint64(len(req.Put.Key) + len(req.Put.Value))
 		case raft_cmdpb.CmdType_Get:
 		case raft_cmdpb.CmdType_Delete:
 			kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
-      d.SizeDiffHint -= uint64(len(req.Delete.Key))
+      // d.SizeDiffHint -= uint64(len(req.Delete.Key))
 		case raft_cmdpb.CmdType_Snap:
 		}
 	}
@@ -100,6 +123,7 @@ func (d *peerMsgHandler) handleClientRequests(requests []*raft_cmdpb.Request, kv
   if cb == nil {
     return
   }
+
   // 响应 (落盘以后才能响应)
 	// 一条 entry 可能包含多条操作，都已落盘，可以放心读取
 	resp := &raft_cmdpb.RaftCmdResponse{
@@ -130,10 +154,17 @@ func (d *peerMsgHandler) handleClientRequests(requests []*raft_cmdpb.Request, kv
 }
 
 func (d *peerMsgHandler) handleCompactLog(request *raft_cmdpb.CompactLogRequest, kvWB *engine_util.WriteBatch) {
-  d.peerStorage.applyState.TruncatedState.Index = request.CompactIndex
-  d.peerStorage.applyState.TruncatedState.Term = request.CompactTerm
-  kvWB.WriteToDB(d.ctx.engine.Kv)
-  d.ScheduleCompactLog(d.peerStorage.truncatedIndex())
+	compactIndex := request.CompactIndex
+	compactTerm := request.CompactTerm
+	if compactIndex >= d.peerStorage.applyState.TruncatedState.Index {
+		d.peerStorage.applyState.TruncatedState.Index = compactIndex
+		d.peerStorage.applyState.TruncatedState.Term = compactTerm
+		if err := kvWB.SetMeta(meta.ApplyStateKey(d.Region().GetId()), d.peerStorage.applyState); err != nil {
+			panic(err)
+		}
+		kvWB.WriteToDB(d.ctx.engine.Kv)
+		d.ScheduleCompactLog(compactIndex)
+	}
 }
 
 func (d *peerMsgHandler) handleChangePeer(cc *eraftpb.ConfChange, kvWB *engine_util.WriteBatch, cb *message.Callback) {
@@ -199,11 +230,16 @@ func (d *peerMsgHandler) handleChangePeer(cc *eraftpb.ConfChange, kvWB *engine_u
 
 func (d *peerMsgHandler) handleSplitRequest(request *raft_cmdpb.SplitRequest, kvWB *engine_util.WriteBatch, cb *message.Callback) {
 	if err := util.CheckKeyInRegion(request.SplitKey, d.Region()); err != nil {
+		// 更新 ApplyIndex
+		kvWB.WriteToDB(d.ctx.engine.Kv)
 		if cb != nil {
 			cb.Done(ErrResp(err))
 		}
+		return
 	}
 	if len(request.NewPeerIds) != len(d.Region().Peers) {
+		// 更新 ApplyIndex
+		kvWB.WriteToDB(d.ctx.engine.Kv)
 		if cb != nil {
 			cb.Done(ErrResp(&util.ErrStaleCommand{}))
 		}
@@ -242,8 +278,8 @@ func (d *peerMsgHandler) handleSplitRequest(request *raft_cmdpb.SplitRequest, kv
 	meta.setRegion(newRegion, newPeer)
   meta.Unlock()
 
-	d.notifyHeartbeatScheduler(region, d.peer)
-	d.notifyHeartbeatScheduler(newRegion, newPeer)
+	// d.notifyHeartbeatScheduler(region, d.peer)
+	// d.notifyHeartbeatScheduler(newRegion, newPeer)
 
   if cb != nil {
     cb.Done(&raft_cmdpb.RaftCmdResponse{
@@ -313,22 +349,20 @@ func (d *peerMsgHandler) HandleRaftReady() {
     d.peerStorage.applyState.AppliedIndex = entry.Index
     kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 
+		// 执行
 		switch entry.EntryType {
 		case eraftpb.EntryType_EntryNormal:
 			msg := &raft_cmdpb.RaftCmdRequest{}
 			msg.Unmarshal(entry.Data)
-      // 不执行过期的请求
-      if msg.Header.RegionEpoch != nil && util.IsEpochStale(msg.Header.RegionEpoch, d.Region().RegionEpoch) {
-        p := d.findProposal(entry.Index, entry.Term)
-        if p != nil {
-          p.cb.Done(ErrResp(&util.ErrEpochNotMatch{
-            Message: msg.AdminRequest.String(),
-          }))
-        }
-        log.SDebug("%s ignore stale NormalEntry at index=%d, term=%d", d.Tag, entry.Index, entry.Term)
-        continue
-      }
-			// 执行
+			// 不执行过期的请求
+			if err := util.CheckRegionEpoch(msg, d.Region(), true); err != nil {
+				p := d.findProposal(entry.Index, entry.Term)
+				if p != nil {
+					p.cb.Done(ErrResp(err))
+				}
+				log.SDebug("%s ignore stale NormalEntry at index=%d, term=%d", d.Tag, entry.Index, entry.Term)
+				continue
+			}
 			if msg.AdminRequest != nil {
 				adminReq := msg.AdminRequest
 				switch adminReq.CmdType {
@@ -350,13 +384,12 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			msg.Unmarshal(cc.Context)
 			log.SDebug("%s apply ConfChange=%v at index=%d, term=%d", d.Tag, *cc, entry.Index, entry.Term)
 			// 不执行过期的请求
-			if util.IsEpochStale(msg.Header.RegionEpoch, d.Region().RegionEpoch) {
-				if cb != nil {
-					p.cb.Done(ErrResp(&util.ErrEpochNotMatch{
-						Message: msg.AdminRequest.String(),
-					}))
+			if err := util.CheckRegionEpoch(msg, d.Region(), true); err != nil {
+				p := d.findProposal(entry.Index, entry.Term)
+				if p != nil {
+					p.cb.Done(ErrResp(err))
 				}
-				log.SDebug("%s ignore stale ConfChange at index=%d, term=%d", d.Tag, entry.Index, entry.Term)
+				log.SDebug("%s ignore stale NormalEntry at index=%d, term=%d", d.Tag, entry.Index, entry.Term)
 				continue
 			}
       d.handleChangePeer(cc, kvWB, cb)

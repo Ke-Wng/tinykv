@@ -303,6 +303,9 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	meta := m.Snapshot.Metadata
 	// stale snapshot，日志不能回退
 	if meta.Index <= r.RaftLog.committed {
+    resp.Index = r.RaftLog.LastIndex()
+    resp.Reject = true
+    r.send(resp)
 		r.DPrintf(log.DSnap, "%d refuse stale snapshot(index=%d, term=%d) from %d", r.id, meta.Index, meta.Term, m.From)
 		return
 	}
