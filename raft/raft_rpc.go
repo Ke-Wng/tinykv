@@ -73,8 +73,10 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 		// 保存下来给哪个节点投票了
 		r.electionElapsed = 0
 		r.Vote = m.From
+		r.DPrintf(log.DVote, "%d vote for %d", r.id, m.From)
   } else {
 		// 拒绝投票
+		r.DPrintf(log.DVote, "%d refused vote for %d", r.id, m.From)
 		r.send(pb.Message{To: m.From, Term: r.Term, MsgType: pb.MessageType_MsgRequestVoteResponse, Reject: true})
   }
 }
@@ -166,8 +168,20 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	prevLogTerm := m.LogTerm
 
 	// 如果接收者的日志在 prevLogIndex 处没有 prevLogTerm 这个任期的条目（一致性检查失败）
-	if term, err := r.RaftLog.Term(prevLogIndex); err != nil || term != prevLogTerm {
+	if term, err := r.RaftLog.Term(prevLogIndex); err != nil {
 		resp.Reject = true
+		r.send(resp)
+		r.DPrintf(log.DAppend, "%d refuse conflicted entries from %d", r.id, m.From)
+		return
+	} else if term != prevLogTerm {
+		resp.Reject = true
+		resp.LogTerm = term // ConflictTerm
+		for i := range r.RaftLog.entries {
+			if r.RaftLog.entries[i].Term == term {
+				resp.Index = r.RaftLog.entries[i].Index
+				break
+			}
+		}
 		r.send(resp)
 		r.DPrintf(log.DAppend, "%d refuse conflicted entries from %d", r.id, m.From)
 		return
@@ -211,7 +225,21 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 
 	// 同步失败，更新 next 重新同步（一次跳过一条日志）
 	if m.Reject {
-		r.Prs[m.From].Next = max(min(m.Index + 1, r.Prs[m.From].Next - 1), 1)
+		if m.LogTerm != 0 {
+			found := false
+			for i := range r.RaftLog.entries {
+				if r.RaftLog.entries[i].Term == m.LogTerm {
+					r.Prs[m.From].Next = r.RaftLog.entries[i].Index + 1
+					found = true
+					break
+				}
+			}
+			if !found {
+				r.Prs[m.From].Next = m.Index
+			}
+		} else {
+			r.Prs[m.From].Next = m.Index + 1
+		}
 		r.replicateLog(m.From)
 		return
 	}
