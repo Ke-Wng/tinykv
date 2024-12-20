@@ -133,6 +133,9 @@ func (r *Raft) sendAppend(to uint64) bool {
 		entries = append(entries, &r.RaftLog.entries[i-firstIndex])
 	}
 
+	// pipeline
+	r.Prs[to].Next = r.RaftLog.LastIndex() + 1
+
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgAppend,
 		To: to,
@@ -160,18 +163,23 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		Term: r.Term,
 		To: m.From,
 		From: r.id,
-		// 失败的时候返回接收者最大的索引,
-		// 成功的时候返回接收者最新同步到的索引
-		Index: r.RaftLog.LastIndex(),
+		// 成功时，返回接收者最新同步到的索引
+		// 失败时，帮助 leader 调整 nextIndex
+		Index: r.RaftLog.committed,
 	}
 	prevLogIndex := m.Index
 	prevLogTerm := m.LogTerm
 
 	// 如果接收者的日志在 prevLogIndex 处没有 prevLogTerm 这个任期的条目（一致性检查失败）
 	if term, err := r.RaftLog.Term(prevLogIndex); err != nil {
-		resp.Reject = true
+		// 如果日志被 compact 了，应该返回成功
+		if err == ErrCompacted {
+			r.DPrintf(log.DAppend, "%d accept compacted entries[%d:] from %d", r.id, prevLogIndex+1, m.From)
+		} else {
+			resp.Reject = true
+			r.DPrintf(log.DAppend, "%d refuse conflicted entries from %d", r.id, m.From)
+		}
 		r.send(resp)
-		r.DPrintf(log.DAppend, "%d refuse conflicted entries from %d", r.id, m.From)
 		return
 	} else if term != prevLogTerm {
 		resp.Reject = true
@@ -245,8 +253,8 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 	}
 
 	// 同步成功, 更新 match 和 next
-	r.Prs[m.From].Match = m.Index
-	r.Prs[m.From].Next = m.Index + 1
+	r.Prs[m.From].Match = max(r.Prs[m.From].Match, m.Index) // match 不能回退
+	r.Prs[m.From].Next = m.Index + 1 // next 回退也问题不大，最多多发送几条 entry
 
 	// 更新 commit
 	if r.maybeCommit() {
