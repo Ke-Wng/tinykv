@@ -339,7 +339,7 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 }
 
 // Apply the peer with given snapshot
-func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_util.WriteBatch, raftWB *engine_util.WriteBatch) (*ApplySnapResult, error) {
+func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot) (*ApplySnapResult, error) {
 	log.Infof("%v begin to apply snapshot", ps.Tag)
 	snapData := new(rspb.RaftSnapshotData)
 	if err := snapData.Unmarshal(snapshot.Data); err != nil {
@@ -350,9 +350,15 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	truncatedIndex, truncatedTerm := snapshot.Metadata.Index, snapshot.Metadata.Term
+	kvWB := &engine_util.WriteBatch{}
+	raftWB := &engine_util.WriteBatch{}
+	lastIncludedIndex, lastIncludedTerm := snapshot.Metadata.Index, snapshot.Metadata.Term
+	if lastIncludedIndex <= ps.applyState.AppliedIndex {
+		// 实际上 raft 层不应该接收这样的 snapshot，出现这种情况可能是因为 apply channel 中有过期的快照
+		log.SDebug("ignore stale snapshot=%v, where HardState=%v", snapshot.Metadata, ps.raftState.HardState)
+		return nil, nil
+	}
 	log.SDebug("%v begin to apply snapshot=%v", ps.Tag, snapshot.Metadata)
-	log.Assert(truncatedIndex >= ps.raftState.HardState.Commit, "can not apply stale snapshot=%v, where HardState=%v", snapshot.Metadata, ps.raftState.HardState)
 	// remove stale data
 	result := &ApplySnapResult{
 		PrevRegion: ps.Region(),
@@ -363,33 +369,6 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 			return nil, err
 		}
 		ps.clearExtraData(snapData.GetRegion())
-	}
-	// update raftState
-	ps.raftState.HardState.Commit = truncatedIndex
-	ps.raftState.HardState.Term = truncatedTerm
-	if truncatedIndex > ps.raftState.LastIndex {
-		ps.raftState.LastIndex = truncatedIndex
-		ps.raftState.LastTerm = truncatedTerm
-	}
-	if err := raftWB.SetMeta(meta.RaftStateKey(snapData.Region.GetId()), ps.raftState); err != nil {
-		return nil, err
-	}
-	// update applyState
-	ps.applyState.AppliedIndex = truncatedIndex
-	ps.applyState.TruncatedState.Index = truncatedIndex
-	ps.applyState.TruncatedState.Term = truncatedTerm
-	if err := kvWB.SetMeta(meta.ApplyStateKey(snapData.Region.GetId()), ps.applyState); err != nil {
-		return nil, err
-	}
-	// updata regionState
-	ps.region = snapData.GetRegion()	
-	meta.WriteRegionState(kvWB, snapData.GetRegion(), rspb.PeerState_Normal)	
-	// persist
-	if err := kvWB.WriteToDB(ps.Engines.Kv); err != nil {
-		return nil, err
-	}
-	if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
-		return nil, err
 	}
 	// apply data
 	ps.snapState.StateType = snap.SnapState_Applying
@@ -404,39 +383,65 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	if !(<-ch) {
 		return nil, nil
 	}
+	// update raftState
+	if lastIncludedIndex > ps.raftState.HardState.Commit {
+		ps.raftState.HardState.Commit = lastIncludedIndex
+	}
+	if lastIncludedIndex > ps.raftState.LastIndex {
+		ps.raftState.LastIndex = lastIncludedIndex
+		ps.raftState.LastTerm = lastIncludedTerm
+	}
+	if err := raftWB.SetMeta(meta.RaftStateKey(snapData.Region.GetId()), ps.raftState); err != nil {
+		return nil, err
+	}
+	// update applyState
+	ps.applyState.TruncatedState.Index = lastIncludedIndex
+	ps.applyState.TruncatedState.Term = lastIncludedTerm
+	ps.applyState.AppliedIndex = lastIncludedIndex
+	if err := kvWB.SetMeta(meta.ApplyStateKey(snapData.Region.GetId()), ps.applyState); err != nil {
+		return nil, err
+	}
+	// updata regionState
+	// 这里只用将 region state 持久化，不用修改 peer 的 region 信息
+	// peer 的  region 稍后在持有锁的情况下和 StoreMeta 中的 region 一起更新
+	// 否则会出现二者不一致的情况
+	meta.WriteRegionState(kvWB, snapData.GetRegion(), rspb.PeerState_Normal)	
+	// persist
+	if err := kvWB.WriteToDB(ps.Engines.Kv); err != nil {
+		return nil, err
+	}
+	if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
 // Save memory states to disk.
 // Do not modify ready in this function, this is a requirement to advance the ready object properly later.
-func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
+func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) error {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
 	if len(ready.Entries) == 0 && raft.IsEmptyHardState(ready.HardState) {
-		return nil, nil
+		return nil
 	}
 	raftWB := engine_util.WriteBatch{}
 	kvWB := engine_util.WriteBatch{}
 	if err := ps.Append(ready.Entries, &raftWB); err != nil {
-		return nil, err
+		return err
 	}
 	if !raft.IsEmptyHardState(ready.HardState) {
 		ps.raftState.HardState = &ready.HardState
 	}
 	if err := raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
-		return nil, err
+		return err
 	}
-	if !raft.IsEmptySnap(&ready.Snapshot) {
-		return ps.ApplySnapshot(&ready.Snapshot, &kvWB, &raftWB)
-	} else {
-		if err := kvWB.WriteToDB(ps.Engines.Kv); err != nil {
-			return nil, err
-		}
-		if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
-			return nil, err
-		}
+	if err := kvWB.WriteToDB(ps.Engines.Kv); err != nil {
+		return err
 	}
-	return nil, nil
+	if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (ps *PeerStorage) ClearData() {

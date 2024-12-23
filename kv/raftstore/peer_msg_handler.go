@@ -216,6 +216,7 @@ func (d *peerMsgHandler) handleChangePeer(cc *eraftpb.ConfChange, kvWB *engine_u
       }
     }
   }
+	d.notifyHeartbeatScheduler(d.Region(), d.peer)
   log.SDebug("%s after ConfChange, region=%v", d.Tag, region)
   meta.WriteRegionState(kvWB, region, rspb.PeerState_Normal)
   kvWB.WriteToDB(d.peerStorage.Engines.Kv)
@@ -278,8 +279,8 @@ func (d *peerMsgHandler) handleSplitRequest(request *raft_cmdpb.SplitRequest, kv
 	meta.setRegion(newRegion, newPeer)
   meta.Unlock()
 
-	// d.notifyHeartbeatScheduler(region, d.peer)
-	// d.notifyHeartbeatScheduler(newRegion, newPeer)
+	d.notifyHeartbeatScheduler(region, d.peer)
+	d.notifyHeartbeatScheduler(newRegion, newPeer)
 
   if cb != nil {
     cb.Done(&raft_cmdpb.RaftCmdResponse{
@@ -306,37 +307,50 @@ func (d *peerMsgHandler) notifyHeartbeatScheduler(region *metapb.Region, peer *p
   }
 }
 
-func (d *peerMsgHandler) HandleRaftReady() {
+func (d *peerMsgHandler) applyLogEntriesAndSnapshot(entries []eraftpb.Entry, snapshot *eraftpb.Snapshot) {
 	if d.stopped {
 		return
 	}
-	// Your Code Here (2B).
-	// 获取 Ready
-	if !d.RaftGroup.HasReady() {
-		return
-	}
-	rd := d.RaftGroup.Ready()
-	// 持久化日志和 HardState && 应用快照
-	applyResult, err := d.peerStorage.SaveReadyState(&rd)
-	if err != nil {
-		panic(err)
-	}
-	// 如果应用了快照，region 信息可能发生变更
-  // ApplySnapshot() 已经将变化写入了 peerStorage，这里还需要将变化写入 storeMeta
-	if applyResult != nil {
-    meta := d.ctx.storeMeta
-    meta.Lock()
-    delete(meta.regions, applyResult.PrevRegion.Id)
-    meta.regionRanges.Delete(&regionItem{region: applyResult.PrevRegion})
-		meta.setRegion(applyResult.Region, d.peer)
-    meta.regionRanges.ReplaceOrInsert(&regionItem{region: applyResult.Region})
-    meta.Unlock()
+
+	if snapshot != nil && !raft.IsEmptySnap(snapshot) {
+		applyResult, err := d.peerStorage.ApplySnapshot(snapshot)
+		if err != nil {
+			panic(err)
+		}
+		// 如果应用了快照，region 信息可能发生变更
+		// ApplySnapshot() 已经将变化持久化，这里还需要将变化写入 storeMeta 和 peer
+		if applyResult != nil {
+			meta := d.ctx.storeMeta
+			meta.Lock()
+			delete(meta.regions, applyResult.PrevRegion.Id)
+			meta.regionRanges.Delete(&regionItem{region: applyResult.PrevRegion})
+			// 连带 storeMeta 和 peer 的 region 一起更新
+			meta.setRegion(applyResult.Region, d.peer)
+			meta.regionRanges.ReplaceOrInsert(&regionItem{region: applyResult.Region})
+			meta.Unlock()
+			d.RaftGroup.ApplySnapshot()
+		}
 	}
 
 	// 应用日志到状态机
-	for _, entry := range rd.CommittedEntries {
+	applyState := d.peerStorage.applyState
+	for _, entry := range entries {
+		if entry.Index <= applyState.AppliedIndex {
+			// 忽略重复发送的 entries
+			continue
+		}
+		if applyState.TruncatedState.Index >= entry.Index {
+			// 刚应用完快照，跳过过期的 entry
+			return
+		}
 		// 跳过空日志
 		if entry.Data == nil {
+			kvWB := &engine_util.WriteBatch{}
+			log.Assert(applyState.AppliedIndex + 1 == entry.Index, "%s out of order apply: appliedIndex=%d, entryIndex=%d", d.Tag, applyState.AppliedIndex, entry.Index)
+			applyState.AppliedIndex = entry.Index
+			kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+			kvWB.WriteToDB(d.ctx.engine.Kv)
+			d.RaftGroup.ApplyTo(applyState.AppliedIndex)
 			continue
 		}
 
@@ -346,7 +360,8 @@ func (d *peerMsgHandler) HandleRaftReady() {
       cb = p.cb
     }
     kvWB := &engine_util.WriteBatch{}
-    d.peerStorage.applyState.AppliedIndex = entry.Index
+		log.Assert(applyState.AppliedIndex + 1 == entry.Index, "%s out of order apply: appliedIndex=%d, entryIndex=%d", d.Tag, applyState.AppliedIndex, entry.Index)
+    applyState.AppliedIndex = entry.Index
     kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 
 		// 执行
@@ -398,12 +413,38 @@ func (d *peerMsgHandler) HandleRaftReady() {
     if d.stopped {
       return
     }
+
+		d.RaftGroup.ApplyTo(applyState.AppliedIndex)
 	}
+}
+
+
+func (d *peerMsgHandler) HandleRaftReady() ([]eraftpb.Entry, *eraftpb.Snapshot) {
+	if d.stopped {
+		return nil, nil
+	}
+	// Your Code Here (2B).
+	// 获取 Ready
+	if !d.RaftGroup.HasReady() {
+		return nil, nil
+	}
+	rd := d.RaftGroup.Ready()
+	// 持久化日志和 HardState && 应用快照
+	err := d.peerStorage.SaveReadyState(&rd)
+	if err != nil {
+		panic(err)
+	}
+
+	committedEntries := rd.CommittedEntries
+	rd.CommittedEntries = make([]eraftpb.Entry, 0)
+
 	// 发送网络消息
 	if len(rd.Messages) != 0 {
 		d.Send(d.ctx.trans, rd.Messages)
 	}
 	d.RaftGroup.Advance(rd)
+
+	return committedEntries, &rd.Snapshot
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {

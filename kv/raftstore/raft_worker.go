@@ -17,6 +17,7 @@ type raftWorker struct {
 	ctx    *GlobalContext
 
 	closeCh <-chan struct{}
+	applyPool *RaftLogApplyPool
 }
 
 func newRaftWorker(ctx *GlobalContext, pm *router) *raftWorker {
@@ -24,6 +25,7 @@ func newRaftWorker(ctx *GlobalContext, pm *router) *raftWorker {
 		raftCh: pm.peerSender,
 		ctx:    ctx,
 		pr:     pm,
+		applyPool: NewRaftLogApplyPool(1),
 	}
 }
 
@@ -37,6 +39,7 @@ func (rw *raftWorker) run(closeCh <-chan struct{}, wg *sync.WaitGroup) {
 		msgs = msgs[:0]
 		select {
 		case <-closeCh:
+			rw.applyPool.Shutdown()
 			return
 		case msg := <-rw.raftCh:
 			msgs = append(msgs, msg)
@@ -54,7 +57,13 @@ func (rw *raftWorker) run(closeCh <-chan struct{}, wg *sync.WaitGroup) {
 			newPeerMsgHandler(peerState.peer, rw.ctx).HandleMsg(msg)
 		}
 		for _, peerState := range peerStateMap {
-			newPeerMsgHandler(peerState.peer, rw.ctx).HandleRaftReady()
+			entries, snapshot := newPeerMsgHandler(peerState.peer, rw.ctx).HandleRaftReady()
+			rw.applyPool.Submit(&RaftLogApplyTask{
+				entries: entries,
+				snapshot: snapshot,
+				peer: peerState.peer,
+				ctx: rw.ctx,
+			})
 		}
 	}
 }

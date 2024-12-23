@@ -220,6 +220,19 @@ func (rn *RawNode) Advance(rd Ready) {
 	// 丢弃压缩的日志
 	rn.Raft.RaftLog.maybeCompact()
 	// 清空 pendingSnapshot
+	// rn.Raft.RaftLog.pendingSnapshot = nil
+}
+
+// apply 完毕
+func (rn *RawNode) ApplyTo(appliedIndex uint64 ) {
+	if appliedIndex <= rn.Raft.RaftLog.applied {
+		panic("appliedIndex can not go back")
+	}
+	rn.Raft.RaftLog.applied = appliedIndex
+}
+
+func (rn *RawNode) ApplySnapshot() {
+	// 清空 pendingSnapshot
 	rn.Raft.RaftLog.pendingSnapshot = nil
 }
 

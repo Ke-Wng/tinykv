@@ -134,7 +134,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 	}
 
 	// pipeline
-	r.Prs[to].Next = r.RaftLog.LastIndex() + 1
+	r.Prs[to].Next = prevLogIndex + uint64(len(entries))
 
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgAppend,
@@ -309,9 +309,15 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	}
 	r.Lead = m.From
 	meta := m.Snapshot.Metadata
+	// 快照需要一个一个执行，避免和异步的 apply worker 对 pendingSnapshot 字段产生 race
+	if r.RaftLog.pendingSnapshot != nil {
+    resp.Reject = true
+    r.send(resp)
+		r.DPrintf(log.DSnap, "%d is applying the previous snapshot, refuse snapshot(index=%d, term=%d) from %d", r.id, meta.Index, meta.Term, m.From)
+		return
+	}
 	// stale snapshot，日志不能回退
-	if meta.Index <= r.RaftLog.committed {
-    resp.Index = r.RaftLog.LastIndex()
+	if meta.Index <= r.RaftLog.applied {
     resp.Reject = true
     r.send(resp)
 		r.DPrintf(log.DSnap, "%d refuse stale snapshot(index=%d, term=%d) from %d", r.id, meta.Index, meta.Term, m.From)

@@ -175,12 +175,13 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	}
 
   // 如果要找的是 truncatedTerm
-  if i == firstIndex - 1 {
-    if l.pendingSnapshot != nil {
-      return l.pendingSnapshot.Metadata.Term, nil
-    }
+	if l.pendingSnapshot != nil && i == l.pendingSnapshot.Metadata.Index {
+		return l.pendingSnapshot.Metadata.Term, nil
+	}
+
+	if len(l.entries) == 0 || i == firstIndex - 1 {
     return l.storage.Term(i)
-  }
+	}
 
 	return l.entries[i-firstIndex].Term, nil
 }
