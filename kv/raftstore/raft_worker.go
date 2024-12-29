@@ -57,13 +57,7 @@ func (rw *raftWorker) run(closeCh <-chan struct{}, wg *sync.WaitGroup) {
 			newPeerMsgHandler(peerState.peer, rw.ctx).HandleMsg(msg)
 		}
 		for _, peerState := range peerStateMap {
-			entries, snapshot := newPeerMsgHandler(peerState.peer, rw.ctx).HandleRaftReady()
-			rw.applyPool.Submit(&RaftLogApplyTask{
-				entries: entries,
-				snapshot: snapshot,
-				peer: peerState.peer,
-				ctx: rw.ctx,
-			})
+			newPeerMsgHandler(peerState.peer, rw.ctx).HandleRaftReady(rw.applyPool)
 		}
 	}
 }

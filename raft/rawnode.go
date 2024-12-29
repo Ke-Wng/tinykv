@@ -220,18 +220,36 @@ func (rn *RawNode) Advance(rd Ready) {
 	// 丢弃压缩的日志
 	rn.Raft.RaftLog.maybeCompact()
 	// 清空 pendingSnapshot
-	// rn.Raft.RaftLog.pendingSnapshot = nil
+	rn.Raft.RaftLog.pendingSnapshot = nil
+}
+
+func (rn *RawNode) PeerAdvance(rd Ready) {
+	// 状态变更
+	if !IsEmptyHardState(rd.HardState) {
+		rn.prevHardSt = rd.HardState
+	}
+  if rd.SoftState != nil {
+    rn.prevSoftSt = rd.SoftState
+  }
+	// 持久化完毕
+	if len(rd.Entries) > 0 {
+		rn.Raft.RaftLog.stabled = rd.Entries[len(rd.Entries)-1].Index
+	}
+	// 清空消息
+	rn.Raft.msgs = nil
 }
 
 // apply 完毕
-func (rn *RawNode) ApplyTo(appliedIndex uint64 ) {
+func (rn *RawNode) ApplyAdvance(appliedIndex uint64 ) {
 	if appliedIndex <= rn.Raft.RaftLog.applied {
 		panic("appliedIndex can not go back")
 	}
 	rn.Raft.RaftLog.applied = appliedIndex
+	// 丢弃压缩的日志
+	rn.Raft.RaftLog.maybeCompact()
 }
 
-func (rn *RawNode) ApplySnapshot() {
+func (rn *RawNode) SnapshotAdvance() {
 	// 清空 pendingSnapshot
 	rn.Raft.RaftLog.pendingSnapshot = nil
 }
@@ -251,4 +269,11 @@ func (rn *RawNode) GetProgress() map[uint64]Progress {
 // TransferLeader tries to transfer leadership to the given transferee.
 func (rn *RawNode) TransferLeader(transferee uint64) {
 	_ = rn.Raft.Step(pb.Message{MsgType: pb.MessageType_MsgTransferLeader, From: transferee})
+}
+
+func (rn *RawNode) InLease() (uint64, bool) {
+	return rn.Raft.RaftLog.committed, 
+			rn.Raft.State == StateLeader && rn.Raft.leadTransferee == None && // is leader
+			rn.Raft.totalTickCount < rn.Raft.leaseDeadline && // in lease
+			mustTerm(rn.Raft.RaftLog.Term(rn.Raft.RaftLog.committed)) == rn.Raft.Term // has newest committedIndex
 }

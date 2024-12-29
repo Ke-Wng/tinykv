@@ -184,6 +184,11 @@ type Raft struct {
 	// value.
 	// (Used in 3A conf change)
 	PendingConfIndex uint64
+
+	totalTickCount  int		
+	leaseStart			int
+	leaseDeadline		int
+	acks 						map[uint64]bool
 }
 
 // newRaft return a raft peer with the given config
@@ -207,6 +212,7 @@ func newRaft(c *Config) *Raft {
 		Prs:              make(map[uint64]*Progress),
 		electionTimeout:  c.ElectionTick,
 		heartbeatTimeout: c.HeartbeatTick,
+		acks:             make(map[uint64]bool),
 	}
 
 	peers := c.peers
@@ -233,6 +239,7 @@ func newRaft(c *Config) *Raft {
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
+	r.totalTickCount++
   r.electionElapsed++
 	switch r.State {
 	case StateFollower, StateCandidate:
@@ -280,6 +287,9 @@ func (r *Raft) reset(term uint64) {
 			r.Prs[id].Match = r.RaftLog.LastIndex()
 		}
 	}
+	r.leaseStart = 0
+	r.leaseDeadline = 0
+	r.acks = make(map[uint64]bool)
 }
 
 // becomeFollower transform this peer's state to Follower

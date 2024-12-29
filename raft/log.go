@@ -131,9 +131,8 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
 	firstIndex := l.FirstIndex()
-	off := max(l.applied+1, firstIndex)
-	if l.committed+1 > off {	// 如果commit索引比前面得到的值还大，说明还有没有commit了但是还没apply的数据，将这些数据返回
-    return l.entries[off-firstIndex:l.committed+1-firstIndex]
+	if len(l.entries) > 0 {
+		return l.entries[l.applied+1-firstIndex : l.committed+1-firstIndex]
 	}
 	return make([]pb.Entry, 0)
 }

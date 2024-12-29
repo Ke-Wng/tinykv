@@ -21,6 +21,8 @@ func (r *Raft) sendHeartbeat(to uint64) {
 		From: r.id,
 	}
   r.send(msg)
+	r.acks = make(map[uint64]bool)
+	r.leaseStart = r.totalTickCount
 }
 
 // handleHeartbeat handle Heartbeat RPC request
@@ -38,6 +40,7 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 
 func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 	log.Assert(r.State == StateLeader, "%s can not handle HeartBeatResponse", r.State)
+	r.checkLease(m.From, true)
 	pr := r.Prs[m.From]
 	// 节点的日志滞后了，尝试同步
 	if pr.Match < r.RaftLog.LastIndex() {
@@ -230,6 +233,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 
 func (r *Raft) handleAppendResponse(m pb.Message) {
 	log.Assert(r.State == StateLeader, "%s can not handle AppendResponse", r.State)
+	r.checkLease(m.From, true)
 
 	// 同步失败，更新 next 重新同步（一次跳过一条日志）
 	if m.Reject {
@@ -374,4 +378,17 @@ func (r *Raft) handleTransferLeader(m pb.Message) {
 
 func (r *Raft) sendTimeoutNow(to uint64) {
 	r.send(pb.Message{To: to, MsgType: pb.MessageType_MsgTimeoutNow})
+}
+
+func (r *Raft) checkLease(from uint64, ack bool) {
+	agrNum	:= 0 // 赞同票数
+	r.acks[from] = ack
+	for _, ack := range r.acks {
+		if ack {
+			agrNum ++
+		}
+	}
+	if agrNum >= r.quorum() {
+		r.leaseDeadline = r.leaseStart + r.electionTimeout * 9 / 10
+	}
 }

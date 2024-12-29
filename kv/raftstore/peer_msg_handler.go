@@ -164,7 +164,10 @@ func (d *peerMsgHandler) handleCompactLog(request *raft_cmdpb.CompactLogRequest,
 		}
 		kvWB.WriteToDB(d.ctx.engine.Kv)
 		d.ScheduleCompactLog(compactIndex)
-	}
+	} else {
+    // 更新 applyIndex
+		kvWB.WriteToDB(d.ctx.engine.Kv)
+  }
 }
 
 func (d *peerMsgHandler) handleChangePeer(cc *eraftpb.ConfChange, kvWB *engine_util.WriteBatch, cb *message.Callback) {
@@ -307,6 +310,72 @@ func (d *peerMsgHandler) notifyHeartbeatScheduler(region *metapb.Region, peer *p
   }
 }
 
+func (d *peerMsgHandler) handleReadRequest(req *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+  if err := util.CheckRegionEpoch(req, d.Region(), true); err != nil {
+    if cb != nil {
+      cb.Done(ErrResp(err))
+    }
+    return
+  }
+
+  cmd := req.Requests[0]
+  if cmd.CmdType == raft_cmdpb.CmdType_Get {
+    if err := util.CheckKeyInRegion(cmd.Get.Key, d.Region()); err != nil {
+      if cb != nil {
+        cb.Done(ErrResp(err))
+      }
+      return
+    }
+  }
+
+  // 响应 (落盘以后才能响应)
+  // 一条 entry 可能包含多条操作，都已落盘，可以放心读取
+  resp := &raft_cmdpb.RaftCmdResponse{
+    Header:    &raft_cmdpb.RaftResponseHeader{},
+    Responses: make([]*raft_cmdpb.Response, 1),
+  }
+  switch cmd.CmdType {
+  case raft_cmdpb.CmdType_Get:
+    val, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, cmd.Get.Cf, cmd.Get.Key)
+    resp.Responses[0] = &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Get, Get: &raft_cmdpb.GetResponse{Value: val}}
+  case raft_cmdpb.CmdType_Snap:
+    // copy region
+    region := new(metapb.Region)
+    err := util.CloneMsg(d.Region(), region)
+    if err != nil {
+      panic(err)
+    }
+    resp.Responses[0] = &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Snap, Snap: &raft_cmdpb.SnapResponse{Region: region}}
+    cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+  }
+  cb.Done(resp)
+}
+
+func (d *peerMsgHandler) handleLeaseRead(committedIndex uint64) {
+	for len(d.pendingReads) > 0 {
+    readCmd := d.pendingReads[0]
+		cb := readCmd.cb
+    if readCmd.term < d.Term() {
+      if cb != nil {
+        cb.Done(ErrResp(&util.ErrStaleCommand{}))
+      }
+			d.pendingReads = d.pendingReads[1:]
+      continue
+    }
+
+    log.Assert(readCmd.term == d.Term(), "pengding read's term=%d can not larger than current term=%d", readCmd.term, d.Term())
+
+		// readIndex 应该是递增的
+		if committedIndex < readCmd.readIndex {
+			return
+		}
+
+    log.SDebug("%s handle lease read at readIndex=%d, term=%d", d.Tag, readCmd.readIndex, readCmd.term)
+    d.pendingReads = d.pendingReads[1:]
+    d.handleReadRequest(readCmd.msg, cb)
+	}
+}
+
 func (d *peerMsgHandler) applyLogEntriesAndSnapshot(entries []eraftpb.Entry, snapshot *eraftpb.Snapshot) {
 	if d.stopped {
 		return
@@ -328,7 +397,7 @@ func (d *peerMsgHandler) applyLogEntriesAndSnapshot(entries []eraftpb.Entry, sna
 			meta.setRegion(applyResult.Region, d.peer)
 			meta.regionRanges.ReplaceOrInsert(&regionItem{region: applyResult.Region})
 			meta.Unlock()
-			d.RaftGroup.ApplySnapshot()
+			d.RaftGroup.SnapshotAdvance()
 		}
 	}
 
@@ -341,7 +410,7 @@ func (d *peerMsgHandler) applyLogEntriesAndSnapshot(entries []eraftpb.Entry, sna
 		}
 		if applyState.TruncatedState.Index >= entry.Index {
 			// 刚应用完快照，跳过过期的 entry
-			return
+			continue
 		}
 		// 跳过空日志
 		if entry.Data == nil {
@@ -350,7 +419,8 @@ func (d *peerMsgHandler) applyLogEntriesAndSnapshot(entries []eraftpb.Entry, sna
 			applyState.AppliedIndex = entry.Index
 			kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 			kvWB.WriteToDB(d.ctx.engine.Kv)
-			d.RaftGroup.ApplyTo(applyState.AppliedIndex)
+			d.RaftGroup.ApplyAdvance(applyState.AppliedIndex)
+      d.handleLeaseRead(applyState.AppliedIndex)
 			continue
 		}
 
@@ -376,7 +446,9 @@ func (d *peerMsgHandler) applyLogEntriesAndSnapshot(entries []eraftpb.Entry, sna
 					p.cb.Done(ErrResp(err))
 				}
 				log.SDebug("%s ignore stale NormalEntry at index=%d, term=%d", d.Tag, entry.Index, entry.Term)
-				continue
+        // 更新 applyIndex
+        kvWB.WriteToDB(d.ctx.engine.Kv)
+				break
 			}
 			if msg.AdminRequest != nil {
 				adminReq := msg.AdminRequest
@@ -405,7 +477,9 @@ func (d *peerMsgHandler) applyLogEntriesAndSnapshot(entries []eraftpb.Entry, sna
 					p.cb.Done(ErrResp(err))
 				}
 				log.SDebug("%s ignore stale NormalEntry at index=%d, term=%d", d.Tag, entry.Index, entry.Term)
-				continue
+        // 更新 applyIndex
+        kvWB.WriteToDB(d.ctx.engine.Kv)
+				break
 			}
       d.handleChangePeer(cc, kvWB, cb)
 		}
@@ -414,37 +488,42 @@ func (d *peerMsgHandler) applyLogEntriesAndSnapshot(entries []eraftpb.Entry, sna
       return
     }
 
-		d.RaftGroup.ApplyTo(applyState.AppliedIndex)
+		d.RaftGroup.ApplyAdvance(applyState.AppliedIndex)
+    d.handleLeaseRead(applyState.AppliedIndex)
 	}
 }
 
 
-func (d *peerMsgHandler) HandleRaftReady() ([]eraftpb.Entry, *eraftpb.Snapshot) {
+func (d *peerMsgHandler) HandleRaftReady(applyPool *RaftLogApplyPool) {
 	if d.stopped {
-		return nil, nil
+		return
 	}
 	// Your Code Here (2B).
 	// 获取 Ready
 	if !d.RaftGroup.HasReady() {
-		return nil, nil
+		return
 	}
 	rd := d.RaftGroup.Ready()
-	// 持久化日志和 HardState && 应用快照
+
+	applyPool.Submit(&RaftLogApplyTask{
+		entries: rd.CommittedEntries,
+		snapshot: &rd.Snapshot,
+		peer: d.peer,
+		ctx: d.ctx,
+	})
+	
+	// 持久化日志和 HardState
 	err := d.peerStorage.SaveReadyState(&rd)
 	if err != nil {
 		panic(err)
 	}
 
-	committedEntries := rd.CommittedEntries
-	rd.CommittedEntries = make([]eraftpb.Entry, 0)
-
 	// 发送网络消息
 	if len(rd.Messages) != 0 {
 		d.Send(d.ctx.trans, rd.Messages)
 	}
-	d.RaftGroup.Advance(rd)
 
-	return committedEntries, &rd.Snapshot
+	d.RaftGroup.PeerAdvance(rd)
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -533,6 +612,25 @@ func (d *peerMsgHandler) propose(msg *raft_cmdpb.RaftCmdRequest, cb *message.Cal
 	}
 }
 
+func (d *peerMsgHandler) proposeLeaseRead(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) bool {
+	if committedIndex, ok := d.RaftGroup.InLease(); ok {
+		if d.peerStorage.applyState.AppliedIndex == committedIndex {
+			log.SDebug("%s is in lease and appliedIndex=committedIndex, perform read directly, readIndex=%d, term=%d", d.Tag, committedIndex, d.Term())
+			d.handleReadRequest(msg, cb)
+		} else {
+			log.SDebug("%s is in lease, propose lease read at readIndex=%d, term=%d", d.Tag, committedIndex, d.Term())
+			d.pendingReads = append(d.pendingReads, &readCmd{
+				readIndex: committedIndex,
+				term: d.Term(),
+				msg: msg,
+				cb: cb,
+			})
+		}
+		return true
+	}
+	return false	
+}
+
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
 	err := d.preProposeRaftCommand(msg)
 	if err != nil {
@@ -555,6 +653,8 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	if len(msg.Requests) > 0 {
+		requests := make([]*raft_cmdpb.Request, 0)
+		// 检查所有 key 是否都在 region 中
 		for _, req := range msg.Requests {
 			var key []byte
 			switch req.CmdType {
@@ -569,8 +669,27 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 				cb.Done(ErrResp(err))
 				return
 			}
+
+			requests = append(requests, req)
+			// 如果是 read only 请求，尝试 lease read
+			switch req.CmdType {
+			case raft_cmdpb.CmdType_Get, raft_cmdpb.CmdType_Snap:
+				if d.proposeLeaseRead(&raft_cmdpb.RaftCmdRequest{
+					Header: msg.Header,
+					Requests: []*raft_cmdpb.Request{req},
+				}, cb) {
+					// lease read 成功，则不需要再发起 propose
+					requests = requests[:len(requests)-1]
+				}
+			}
 		}
-		d.propose(msg, cb)
+
+		if len(requests) > 0 {
+			d.propose(&raft_cmdpb.RaftCmdRequest{
+				Header:   msg.Header,
+				Requests: requests,
+			}, cb)
+		}
 	} else if msg.AdminRequest != nil {
 		req := msg.AdminRequest
 		switch req.CmdType {

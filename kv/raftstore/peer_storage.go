@@ -383,17 +383,6 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot) (*ApplySnapResu
 	if !(<-ch) {
 		return nil, nil
 	}
-	// update raftState
-	if lastIncludedIndex > ps.raftState.HardState.Commit {
-		ps.raftState.HardState.Commit = lastIncludedIndex
-	}
-	if lastIncludedIndex > ps.raftState.LastIndex {
-		ps.raftState.LastIndex = lastIncludedIndex
-		ps.raftState.LastTerm = lastIncludedTerm
-	}
-	if err := raftWB.SetMeta(meta.RaftStateKey(snapData.Region.GetId()), ps.raftState); err != nil {
-		return nil, err
-	}
 	// update applyState
 	ps.applyState.TruncatedState.Index = lastIncludedIndex
 	ps.applyState.TruncatedState.Term = lastIncludedTerm
@@ -410,9 +399,6 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot) (*ApplySnapResu
 	if err := kvWB.WriteToDB(ps.Engines.Kv); err != nil {
 		return nil, err
 	}
-	if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
-		return nil, err
-	}
 	return result, nil
 }
 
@@ -425,17 +411,22 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) error {
 		return nil
 	}
 	raftWB := engine_util.WriteBatch{}
-	kvWB := engine_util.WriteBatch{}
 	if err := ps.Append(ready.Entries, &raftWB); err != nil {
 		return err
 	}
 	if !raft.IsEmptyHardState(ready.HardState) {
 		ps.raftState.HardState = &ready.HardState
 	}
-	if err := raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
-		return err
+	snapshot := ready.Snapshot
+	if !raft.IsEmptySnap(&snapshot) {
+		lastIncludedIndex, lastIncludedTerm := snapshot.Metadata.Index, snapshot.Metadata.Term
+		// update raftState
+		if lastIncludedIndex > ps.raftState.LastIndex {
+			ps.raftState.LastIndex = lastIncludedIndex
+			ps.raftState.LastTerm = lastIncludedTerm
+		}
 	}
-	if err := kvWB.WriteToDB(ps.Engines.Kv); err != nil {
+	if err := raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
 		return err
 	}
 	if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {

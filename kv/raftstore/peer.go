@@ -14,6 +14,7 @@ import (
 	"github.com/pingcap-incubator/tinykv/log"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
 	"github.com/pingcap-incubator/tinykv/raft"
 	"github.com/pingcap/errors"
@@ -63,6 +64,13 @@ type proposal struct {
 	cb    *message.Callback
 }
 
+type readCmd struct {
+	readIndex    uint64
+	term				 uint64
+	msg          *raft_cmdpb.RaftCmdRequest
+	cb           *message.Callback
+}
+
 type peer struct {
 	// The ticker of the peer, used to trigger
 	// * raft tick
@@ -84,6 +92,7 @@ type peer struct {
 	// Record the callback of the proposals
 	// (Used in 2B)
 	proposals []*proposal
+	pendingReads  []*readCmd
 
 	// Index of last scheduled compacted raft log.
 	// (Used in 2C)

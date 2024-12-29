@@ -70,11 +70,7 @@ func (p *RaftLogApplyPool) work(task *RaftLogApplyTask) {
 // Submit adds a new task to the pool
 func (p *RaftLogApplyPool) Submit(task *RaftLogApplyTask) {
 	workerIndex := int(task.peer.regionId) % len(p.workerChs)
-	select {
-	case p.workerChs[workerIndex] <- task:
-	case <-p.closeCh:
-		// Pool is shutting down, ignore new tasks
-	}
+	p.workerChs[workerIndex] <- task
 }
 
 func (p *RaftLogApplyPool) Shutdown() {
