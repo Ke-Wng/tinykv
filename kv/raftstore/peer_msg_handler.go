@@ -186,6 +186,7 @@ func (d *peerMsgHandler) handleChangePeer(cc *eraftpb.ConfChange, kvWB *engine_u
   case eraftpb.ConfChangeType_AddNode:
     for _, p := range region.Peers {
       if p.Id == cc.NodeId {
+				kvWB.WriteToDB(d.ctx.engine.Kv)
         return
       }
     }
@@ -202,6 +203,7 @@ func (d *peerMsgHandler) handleChangePeer(cc *eraftpb.ConfChange, kvWB *engine_u
 		meta.Unlock()
   case eraftpb.ConfChangeType_RemoveNode:
     if cc.NodeId == d.PeerId() {
+			kvWB.WriteToDB(d.ctx.engine.Kv)
       d.destroyPeer()
       if cb != nil {
         cb.Done(resp)

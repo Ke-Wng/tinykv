@@ -257,7 +257,7 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 	}
 
 	// 同步成功, 更新 match 和 next
-	r.Prs[m.From].Match = max(r.Prs[m.From].Match, m.Index) // match 不能回退
+	r.Prs[m.From].Match = m.Index
 	r.Prs[m.From].Next = m.Index + 1 // next 回退也问题不大，最多多发送几条 entry
 
 	// 更新 commit
