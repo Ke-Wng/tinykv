@@ -185,9 +185,9 @@ type Raft struct {
 	// (Used in 3A conf change)
 	PendingConfIndex uint64
 
-	totalTickCount  int		
-	leaseStart			int
-	leaseDeadline		int
+	totalTickCount  int	// 全局时钟	
+	leaseStart			int // 租约开始时间
+	leaseDeadline		int // 租约结束时间
 	acks 						map[uint64]bool
 }
 

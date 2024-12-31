@@ -312,44 +312,45 @@ func (d *peerMsgHandler) notifyHeartbeatScheduler(region *metapb.Region, peer *p
   }
 }
 
-func (d *peerMsgHandler) handleReadRequest(req *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
-  if err := util.CheckRegionEpoch(req, d.Region(), true); err != nil {
+func (d *peerMsgHandler) handleReadRequest(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+  if err := util.CheckRegionEpoch(msg, d.Region(), true); err != nil {
     if cb != nil {
       cb.Done(ErrResp(err))
     }
     return
   }
 
-  cmd := req.Requests[0]
-  if cmd.CmdType == raft_cmdpb.CmdType_Get {
-    if err := util.CheckKeyInRegion(cmd.Get.Key, d.Region()); err != nil {
-      if cb != nil {
-        cb.Done(ErrResp(err))
-      }
-      return
-    }
-  }
+	for _, req := range msg.Requests {
+		if req.CmdType == raft_cmdpb.CmdType_Get {
+			if err := util.CheckKeyInRegion(req.Get.Key, d.Region()); err != nil {
+				if cb != nil {
+					cb.Done(ErrResp(err))
+				}
+				return
+			}
+		}
+	}
 
-  // 响应 (落盘以后才能响应)
-  // 一条 entry 可能包含多条操作，都已落盘，可以放心读取
   resp := &raft_cmdpb.RaftCmdResponse{
     Header:    &raft_cmdpb.RaftResponseHeader{},
-    Responses: make([]*raft_cmdpb.Response, 1),
+    Responses: make([]*raft_cmdpb.Response, len(msg.Requests)),
   }
-  switch cmd.CmdType {
-  case raft_cmdpb.CmdType_Get:
-    val, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, cmd.Get.Cf, cmd.Get.Key)
-    resp.Responses[0] = &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Get, Get: &raft_cmdpb.GetResponse{Value: val}}
-  case raft_cmdpb.CmdType_Snap:
-    // copy region
-    region := new(metapb.Region)
-    err := util.CloneMsg(d.Region(), region)
-    if err != nil {
-      panic(err)
-    }
-    resp.Responses[0] = &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Snap, Snap: &raft_cmdpb.SnapResponse{Region: region}}
-    cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
-  }
+	for i, req := range msg.Requests {
+		switch req.CmdType {
+		case raft_cmdpb.CmdType_Get:
+			val, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
+			resp.Responses[i] = &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Get, Get: &raft_cmdpb.GetResponse{Value: val}}
+		case raft_cmdpb.CmdType_Snap:
+			// copy region
+			region := new(metapb.Region)
+			err := util.CloneMsg(d.Region(), region)
+			if err != nil {
+				panic(err)
+			}
+			resp.Responses[i] = &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Snap, Snap: &raft_cmdpb.SnapResponse{Region: region}}
+			cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+		}
+	}
   cb.Done(resp)
 }
 
@@ -655,43 +656,32 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	if len(msg.Requests) > 0 {
-		requests := make([]*raft_cmdpb.Request, 0)
 		// 检查所有 key 是否都在 region 中
+		readOnly := true
 		for _, req := range msg.Requests {
 			var key []byte
 			switch req.CmdType {
 			case raft_cmdpb.CmdType_Put:
 				key = req.Put.Key
+				readOnly = false
 			case raft_cmdpb.CmdType_Get:
 				key = req.Get.Key
 			case raft_cmdpb.CmdType_Delete:
 				key = req.Delete.Key
+				readOnly = false
 			}
 			if err := util.CheckKeyInRegion(key, d.Region()); err != nil && req.CmdType != raft_cmdpb.CmdType_Snap {
 				cb.Done(ErrResp(err))
 				return
 			}
-
-			requests = append(requests, req)
-			// 如果是 read only 请求，尝试 lease read
-			switch req.CmdType {
-			case raft_cmdpb.CmdType_Get, raft_cmdpb.CmdType_Snap:
-				if d.proposeLeaseRead(&raft_cmdpb.RaftCmdRequest{
-					Header: msg.Header,
-					Requests: []*raft_cmdpb.Request{req},
-				}, cb) {
-					// lease read 成功，则不需要再发起 propose
-					requests = requests[:len(requests)-1]
-				}
+		}
+		// 如果是 read only 请求，尝试 lease read
+		if readOnly {
+			if d.proposeLeaseRead(msg, cb) {
+				return
 			}
 		}
-
-		if len(requests) > 0 {
-			d.propose(&raft_cmdpb.RaftCmdRequest{
-				Header:   msg.Header,
-				Requests: requests,
-			}, cb)
-		}
+		d.propose(msg, cb)
 	} else if msg.AdminRequest != nil {
 		req := msg.AdminRequest
 		switch req.CmdType {

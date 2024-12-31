@@ -236,6 +236,10 @@ func (p *peer) Destroy(engine *engine_util.Engines, keepData bool) error {
 		NotifyReqRegionRemoved(region.Id, proposal.cb)
 	}
 	p.proposals = nil
+	for _, pending := range p.pendingReads {
+		NotifyReqRegionRemoved(region.Id, pending.cb)
+	}
+	p.pendingReads = nil
 
 	log.Infof("%v destroy itself, takes %v", p.Tag, time.Now().Sub(start))
 	return nil
